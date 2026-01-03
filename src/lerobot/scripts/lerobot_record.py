@@ -111,7 +111,9 @@ from lerobot.teleoperators import (  # noqa: F401
     omx_leader,
     so100_leader,
     so101_leader,
+    telegrip,
 )
+from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.control_utils import (
@@ -259,6 +261,8 @@ def record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    handle_rerecord_event: bool = True,
+    handle_terminate_event: bool = True,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -298,6 +302,24 @@ def record_loop(
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
+
+        # Consume teleop-generated events (e.g., VR controller buttons)
+        if teleop is not None:
+            teleops = teleop if isinstance(teleop, list) else [teleop]
+
+            for teleop_device in teleops:
+                if hasattr(teleop_device, "get_teleop_events"):
+                    teleop_events = teleop_device.get_teleop_events()
+
+                    if handle_rerecord_event and teleop_events.get(TeleopEvents.RERECORD_EPISODE.value, False):
+                        events["rerecord_episode"] = True
+                        events["exit_early"] = True
+
+                    if handle_terminate_event and (
+                        teleop_events.get(TeleopEvents.TERMINATE_EPISODE.value, False)
+                        or teleop_events.get(TeleopEvents.SUCCESS.value, False)
+                    ):
+                        events["exit_early"] = True
 
         if events["exit_early"]:
             events["exit_early"] = False
@@ -478,11 +500,38 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                 )
 
+                if events["rerecord_episode"]:
+                    log_say("Re-record episode", cfg.play_sounds)
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    dataset.clear_episode_buffer()
+
+                    # Give time to reset before re-recording the episode.
+                    if not events["stop_recording"] and cfg.dataset.reset_time_s > 0:
+                        log_say("Reset the environment", cfg.play_sounds)
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            teleop_action_processor=teleop_action_processor,
+                            robot_action_processor=robot_action_processor,
+                            robot_observation_processor=robot_observation_processor,
+                            teleop=teleop,
+                            control_time_s=cfg.dataset.reset_time_s,
+                            single_task=cfg.dataset.single_task,
+                            display_data=cfg.display_data,
+                            handle_rerecord_event=False,
+                            handle_terminate_event=True,
+                        )
+                    continue
+
+                log_say("Saving episode", cfg.play_sounds)
+                dataset.save_episode()
+                recorded_episodes += 1
+
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
-                ):
+                if not events["stop_recording"] and recorded_episodes < cfg.dataset.num_episodes:
                     log_say("Reset the environment", cfg.play_sounds)
                     record_loop(
                         robot=robot,
@@ -495,17 +544,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         control_time_s=cfg.dataset.reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        handle_rerecord_event=False,
+                        handle_terminate_event=True,
                     )
-
-                if events["rerecord_episode"]:
-                    log_say("Re-record episode", cfg.play_sounds)
-                    events["rerecord_episode"] = False
-                    events["exit_early"] = False
-                    dataset.clear_episode_buffer()
-                    continue
-
-                dataset.save_episode()
-                recorded_episodes += 1
     finally:
         log_say("Stop recording", cfg.play_sounds, blocking=True)
 

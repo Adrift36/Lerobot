@@ -154,6 +154,7 @@ dmypy.json
 ### HPC & Slurm ###
 nautilus/*.yaml
 *.key
+*.pem
 sbatch*.sh
 
 ### Miscellaneous ###
@@ -165,7 +166,13 @@ wandb/
 
 # Data folders
 data/
+data_/
 outputs/
+
+# Local Telegrip secrets / local config
+telegrip/key.pem
+telegrip/cert.pem
+telegrip/config.yaml
 
 # Translations
 *.mo
