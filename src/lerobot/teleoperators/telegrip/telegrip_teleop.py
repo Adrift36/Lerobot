@@ -124,6 +124,7 @@ class TelegripTeleoperator(Teleoperator):
                 enable_pybullet_gui=self.config.enable_pybullet_gui,
                 enable_vr=self.config.enable_vr,
                 enable_keyboard=self.config.enable_keyboard,
+                keep_gripper_level=self.config.keep_gripper_level,
                 autoconnect=self.config.autoconnect,
                 log_level=self.config.log_level,
                 https_port=self.config.https_port,

@@ -4,6 +4,7 @@ Consumes control goals from the command queue and executes them via the robot in
 """
 
 import asyncio
+import math
 import numpy as np
 import logging
 import time
@@ -32,6 +33,14 @@ class ArmState:
         self.origin_wrist_flex_angle = 0.0
         self.current_wrist_roll = 0.0
         self.current_wrist_flex = 0.0
+
+        # Controller-driven offsets (degrees) when in relative position mode
+        self.controller_wrist_roll_offset_deg = 0.0
+        self.controller_wrist_flex_offset_deg = 0.0
+
+        # End-effector pitch at the moment position control is activated (degrees).
+        # Used to keep the gripper level / match controller pitch while translating.
+        self.origin_end_effector_pitch_deg: Optional[float] = None
         
     def reset(self):
         """Reset arm state to idle."""
@@ -41,6 +50,9 @@ class ArmState:
         self.origin_position = None
         self.origin_wrist_roll_angle = 0.0
         self.origin_wrist_flex_angle = 0.0
+        self.controller_wrist_roll_offset_deg = 0.0
+        self.controller_wrist_flex_offset_deg = 0.0
+        self.origin_end_effector_pitch_deg = None
 
 
 class ControlLoop:
@@ -308,6 +320,9 @@ class ControlLoop:
                 arm_state.current_wrist_flex = current_angles[WRIST_FLEX_INDEX]
                 arm_state.origin_wrist_roll_angle = current_angles[WRIST_ROLL_INDEX]
                 arm_state.origin_wrist_flex_angle = current_angles[WRIST_FLEX_INDEX]
+
+                # Capture current end-effector pitch as new origin (if FK is available)
+                arm_state.origin_end_effector_pitch_deg = self._get_end_effector_pitch_deg(goal.arm, current_angles)
                 
                 logger.info(f"🔄 {goal.arm.upper()} arm: Target position reset to current robot position (idle timeout)")
             return
@@ -330,6 +345,9 @@ class ControlLoop:
                     arm_state.current_wrist_flex = current_angles[WRIST_FLEX_INDEX]
                     arm_state.origin_wrist_roll_angle = current_angles[WRIST_ROLL_INDEX]
                     arm_state.origin_wrist_flex_angle = current_angles[WRIST_FLEX_INDEX]
+
+                    # Capture end-effector pitch at activation as the origin pitch.
+                    arm_state.origin_end_effector_pitch_deg = self._get_end_effector_pitch_deg(goal.arm, current_angles)
                 
                 logger.info(f"🔒 {goal.arm.upper()} arm: Position control ACTIVATED (target reset to current position)")
                 
@@ -366,6 +384,7 @@ class ControlLoop:
             if goal.wrist_roll_deg is not None:
                 if goal.metadata and goal.metadata.get("relative_position", False):
                     # Both VR and keyboard send absolute wrist angle relative to origin
+                    arm_state.controller_wrist_roll_offset_deg = goal.wrist_roll_deg
                     arm_state.current_wrist_roll = arm_state.origin_wrist_roll_angle + goal.wrist_roll_deg
                 else:
                     # Absolute wrist roll (legacy)
@@ -375,6 +394,7 @@ class ControlLoop:
             if goal.wrist_flex_deg is not None:
                 if goal.metadata and goal.metadata.get("relative_position", False):
                     # Both VR and keyboard send absolute wrist angle relative to origin
+                    arm_state.controller_wrist_flex_offset_deg = goal.wrist_flex_deg
                     arm_state.current_wrist_flex = arm_state.origin_wrist_flex_angle + goal.wrist_flex_deg
                 else:
                     # Absolute wrist flex (legacy)
@@ -410,10 +430,20 @@ class ControlLoop:
             
             # Update robot angles
             current_gripper = self.robot_interface.get_arm_angles("left")[GRIPPER_INDEX]
-            self.robot_interface.update_arm_angles("left", ik_solution, 
-                                                 self.left_arm.current_wrist_flex, 
-                                                 self.left_arm.current_wrist_roll, 
-                                                 current_gripper)
+            wrist_flex_to_send = self._maybe_compensate_wrist_flex_for_pitch(
+                arm="left",
+                ik_angles_deg=ik_solution,
+                wrist_roll_deg=self.left_arm.current_wrist_roll,
+                current_gripper_deg=current_gripper,
+                arm_state=self.left_arm,
+            )
+            self.robot_interface.update_arm_angles(
+                "left",
+                ik_solution,
+                wrist_flex_to_send,
+                self.left_arm.current_wrist_roll,
+                current_gripper,
+            )
 
         # Update right arm (only if connected)
         if (self.right_arm.mode == ControlMode.POSITION_CONTROL and 
@@ -425,10 +455,141 @@ class ControlLoop:
             
             # Update robot angles
             current_gripper = self.robot_interface.get_arm_angles("right")[GRIPPER_INDEX]
-            self.robot_interface.update_arm_angles("right", ik_solution, 
-                                                  self.right_arm.current_wrist_flex, 
-                                                  self.right_arm.current_wrist_roll, 
-                                                  current_gripper)
+            wrist_flex_to_send = self._maybe_compensate_wrist_flex_for_pitch(
+                arm="right",
+                ik_angles_deg=ik_solution,
+                wrist_roll_deg=self.right_arm.current_wrist_roll,
+                current_gripper_deg=current_gripper,
+                arm_state=self.right_arm,
+            )
+            self.robot_interface.update_arm_angles(
+                "right",
+                ik_solution,
+                wrist_flex_to_send,
+                self.right_arm.current_wrist_roll,
+                current_gripper,
+            )
+
+    def _get_end_effector_pitch_deg(self, arm: str, joint_angles_deg: np.ndarray) -> Optional[float]:
+        """Return end-effector pitch (deg) using PyBullet FK if available."""
+        if not self.robot_interface:
+            return None
+
+        fk_solver = self.robot_interface.fk_solvers.get(arm) if hasattr(self.robot_interface, "fk_solvers") else None
+        if not fk_solver:
+            return None
+
+        try:
+            _, quat = fk_solver.compute(joint_angles_deg)
+            import pybullet as p
+
+            # PyBullet returns Euler angles as (roll, pitch, yaw) in radians.
+            _, pitch_rad, _ = p.getEulerFromQuaternion(quat.tolist())
+            return math.degrees(pitch_rad)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _angle_diff_deg(a_deg: float, b_deg: float) -> float:
+        """Smallest signed difference a-b in degrees, in (-180, 180]."""
+        return ((a_deg - b_deg + 180.0) % 360.0) - 180.0
+
+    def _maybe_compensate_wrist_flex_for_pitch(
+        self,
+        arm: str,
+        ik_angles_deg: np.ndarray,
+        wrist_roll_deg: float,
+        current_gripper_deg: float,
+        arm_state: ArmState,
+    ) -> float:
+        """Adjust wrist_flex so end-effector pitch matches controller pitch while translating.
+
+        This keeps the same controller pitch mapping, but compensates for pitch changes
+        introduced by IK motion in the first joints.
+        """
+
+        if not getattr(self.config, "keep_gripper_level", True):
+            return arm_state.current_wrist_flex
+
+        origin_pitch = arm_state.origin_end_effector_pitch_deg
+        if origin_pitch is None:
+            return arm_state.current_wrist_flex
+
+        desired_pitch = origin_pitch + arm_state.controller_wrist_flex_offset_deg
+
+        if not self.robot_interface:
+            return arm_state.current_wrist_flex
+
+        min_flex = float(self.robot_interface.joint_limits_min_deg[WRIST_FLEX_INDEX])
+        max_flex = float(self.robot_interface.joint_limits_max_deg[WRIST_FLEX_INDEX])
+
+        def clamp(v: float) -> float:
+            return float(np.clip(v, min_flex, max_flex))
+
+        def pitch_for_wrist_flex(flex_deg: float) -> Optional[float]:
+            full = np.zeros(NUM_JOINTS)
+            full[:3] = ik_angles_deg
+            full[WRIST_FLEX_INDEX] = flex_deg
+            full[WRIST_ROLL_INDEX] = wrist_roll_deg
+            full[GRIPPER_INDEX] = current_gripper_deg
+            return self._get_end_effector_pitch_deg(arm, full)
+
+        flex = clamp(arm_state.origin_wrist_flex_angle + arm_state.controller_wrist_flex_offset_deg)
+        best_flex = flex
+        best_err = None
+
+        for _ in range(6):
+            pitch = pitch_for_wrist_flex(flex)
+            if pitch is None:
+                break
+            err = self._angle_diff_deg(pitch, desired_pitch)
+            if best_err is None or abs(err) < abs(best_err):
+                best_err = err
+                best_flex = flex
+            if abs(err) < 0.5:
+                break
+
+            delta = 2.0
+            flex2 = clamp(flex + delta)
+            if abs(flex2 - flex) < 1e-6:
+                flex2 = clamp(flex - delta)
+            pitch2 = pitch_for_wrist_flex(flex2)
+            if pitch2 is None or abs(flex2 - flex) < 1e-6:
+                break
+            err2 = self._angle_diff_deg(pitch2, desired_pitch)
+            deriv = (err2 - err) / (flex2 - flex)
+            if abs(deriv) < 1e-3:
+                break
+
+            flex = clamp(flex - err / deriv)
+
+        if best_err is None or abs(best_err) > 1.0:
+            center = best_flex
+            lo = clamp(center - 30.0)
+            hi = clamp(center + 30.0)
+
+            for f in np.linspace(lo, hi, num=31):
+                pitch = pitch_for_wrist_flex(float(f))
+                if pitch is None:
+                    continue
+                err = self._angle_diff_deg(pitch, desired_pitch)
+                if best_err is None or abs(err) < abs(best_err):
+                    best_err = err
+                    best_flex = float(f)
+
+            lo2 = clamp(best_flex - 4.0)
+            hi2 = clamp(best_flex + 4.0)
+            for f in np.linspace(lo2, hi2, num=17):
+                pitch = pitch_for_wrist_flex(float(f))
+                if pitch is None:
+                    continue
+                err = self._angle_diff_deg(pitch, desired_pitch)
+                if best_err is None or abs(err) < abs(best_err):
+                    best_err = err
+                    best_flex = float(f)
+
+        arm_state.current_wrist_flex = best_flex
+        return best_flex
 
         # Send commands to robot
         if self.robot_interface.is_connected and self.robot_interface.is_engaged:

@@ -61,3 +61,6 @@ class TelegripConfig(TeleoperatorConfig):
     enable_pybullet_gui: bool = True
     enable_vr: bool = True
     enable_keyboard: bool = True
+
+    # Control behavior
+    keep_gripper_level: bool = True
