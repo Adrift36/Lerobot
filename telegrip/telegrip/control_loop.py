@@ -426,7 +426,11 @@ class ControlLoop:
             self.robot_interface.get_arm_connection_status("left")):
             
             # Solve IK
-            ik_solution = self.robot_interface.solve_ik("left", self.left_arm.target_position)
+            ik_solution = self._solve_ik_with_nominal_wrist(
+                arm="left",
+                target_position=self.left_arm.target_position,
+                arm_state=self.left_arm,
+            )
             
             # Update robot angles
             current_gripper = self.robot_interface.get_arm_angles("left")[GRIPPER_INDEX]
@@ -451,7 +455,11 @@ class ControlLoop:
             self.robot_interface.get_arm_connection_status("right")):
             
             # Solve IK
-            ik_solution = self.robot_interface.solve_ik("right", self.right_arm.target_position)
+            ik_solution = self._solve_ik_with_nominal_wrist(
+                arm="right",
+                target_position=self.right_arm.target_position,
+                arm_state=self.right_arm,
+            )
             
             # Update robot angles
             current_gripper = self.robot_interface.get_arm_angles("right")[GRIPPER_INDEX]
@@ -469,6 +477,37 @@ class ControlLoop:
                 self.right_arm.current_wrist_roll,
                 current_gripper,
             )
+
+        # Send commands to robot
+        if self.robot_interface.is_connected and self.robot_interface.is_engaged:
+            self.robot_interface.send_command()
+
+    def _solve_ik_with_nominal_wrist(self, arm: str, target_position: np.ndarray, arm_state: ArmState) -> np.ndarray:
+        """Solve IK while keeping wrist joints at the controller-driven (nominal) angles.
+
+        Telegrip's IK targets the jaw tip link, which depends on wrist pitch/roll. If we
+        post-adjust wrist pitch to match end-effector pitch, feeding that adjusted value
+        back into the next IK solve can create a feedback loop (large oscillations).
+
+        This helper solves IK using the nominal controller-driven wrist angles, so the
+        IK state is stable and independent of any post-IK pitch compensation.
+        """
+        if not self.robot_interface:
+            return np.zeros(3)
+
+        current_angles = self.robot_interface.get_arm_angles(arm)
+        current_angles_for_ik = current_angles.copy()
+
+        nominal_wrist_flex = arm_state.origin_wrist_flex_angle + arm_state.controller_wrist_flex_offset_deg
+        nominal_wrist_roll = arm_state.origin_wrist_roll_angle + arm_state.controller_wrist_roll_offset_deg
+        current_angles_for_ik[WRIST_FLEX_INDEX] = nominal_wrist_flex
+        current_angles_for_ik[WRIST_ROLL_INDEX] = nominal_wrist_roll
+
+        ik_solver = self.robot_interface.ik_solvers.get(arm) if hasattr(self.robot_interface, "ik_solvers") else None
+        if not ik_solver:
+            return current_angles_for_ik[:3]
+
+        return ik_solver.solve(target_position, None, current_angles_for_ik)
 
     def _get_end_effector_pitch_deg(self, arm: str, joint_angles_deg: np.ndarray) -> Optional[float]:
         """Return end-effector pitch (deg) using PyBullet FK if available."""
@@ -588,12 +627,7 @@ class ControlLoop:
                     best_err = err
                     best_flex = float(f)
 
-        arm_state.current_wrist_flex = best_flex
         return best_flex
-
-        # Send commands to robot
-        if self.robot_interface.is_connected and self.robot_interface.is_engaged:
-            self.robot_interface.send_command()
     
     def _update_visualization(self):
         """Update PyBullet visualization."""
